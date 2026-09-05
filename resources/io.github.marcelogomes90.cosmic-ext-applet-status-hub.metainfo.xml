@@ -73,6 +73,19 @@
     <keyword>Panel</keyword>
   </keywords>
   <releases>
+    <release type="stable" version="1.5.4" date="2026-09-05">
+      <description>
+        <p>The settings popup no longer scrolls while its content still fits, and the panel icon and the grid of tray icons have been redrawn around their own weight.</p>
+        <ul>
+          <li>Stops the settings popup scrolling from the first item on. The appearance row came from a settings item whose spacer left the label a third of the row, wrapping it over three lines the layout had never budgeted for.</li>
+          <li>Sizes the settings list from the content it holds, up to the popup's ceiling, instead of a height worked out in advance, so a row that measures differently can no longer clip the list.</li>
+          <li>Holds the horizontal inset of the settings rows at a single value whatever the density does, and gives the row dragged across the list the same inset as the rows it moves between.</li>
+          <li>Lines a wrapped setting's second line up with its first, which had kept the space it wrapped on and sat a character further right.</li>
+          <li>Redraws the panel icon on three heavier dots and drops the outline around them, so it stays separate and legible at the size the panel paints it.</li>
+          <li>Centres the tray icons in the popup as one block, while each row still fills from the start.</li>
+        </ul>
+      </description>
+    </release>
     <release type="stable" version="1.5.3" date="2026-09-05">
       <description>
         <p>The installed executable now follows the COSMIC external applet naming convention.</p>
