@@ -20,9 +20,13 @@ pub const LIST_MIN_ROW: u16 = 32;
 
 const SECTION_HEADER: u16 = 21;
 const SECTION_HEADER_SPACING: u16 = 8;
+const BODY_LINE: u16 = 21;
+
+pub const SETTINGS_LABEL_LINES: u16 = 2;
 
 pub const MARGIN_X: u16 = 16;
 pub const MARGIN_Y: u16 = 12;
+pub const LIST_ROW_INSET: u16 = 16;
 
 pub const DRAG_HANDLE_ICON: &str = "grip-lines-symbolic";
 pub const PANEL_ICON: &str = "io.github.marcelogomes90.cosmic-ext-applet-status-hub-symbolic";
@@ -40,14 +44,31 @@ pub fn list_row_spacing() -> u16 {
     cosmic::theme::spacing().space_xxs
 }
 
+pub fn list_row_padding(spacing: u16) -> [u16; 2] {
+    [spacing, LIST_ROW_INSET]
+}
+
 pub fn list_row_height(spacing: u16) -> u16 {
     LIST_MIN_ROW.saturating_add(spacing.saturating_mul(2))
 }
 
+pub fn settings_label_height() -> u16 {
+    BODY_LINE.saturating_mul(SETTINGS_LABEL_LINES)
+}
+
+pub fn settings_label_row_height(spacing: u16) -> u16 {
+    settings_label_height()
+        .max(LIST_MIN_ROW)
+        .saturating_add(spacing.saturating_mul(2))
+}
+
+pub fn section_header_height() -> u16 {
+    SECTION_HEADER.saturating_add(SECTION_HEADER_SPACING)
+}
+
 pub fn section_height(rows: usize, spacing: u16) -> u16 {
     let rows = u16::try_from(rows).unwrap_or(u16::MAX);
-    SECTION_HEADER
-        .saturating_add(SECTION_HEADER_SPACING)
+    section_header_height()
         .saturating_add(rows.saturating_mul(list_row_height(spacing)))
         .saturating_add(rows.saturating_sub(1))
 }
@@ -147,7 +168,8 @@ pub fn header_height(control: u16, vertical_padding: u16) -> u16 {
 }
 
 pub fn settings_body_height(rows: usize, spacing: u16, padding: u16) -> u16 {
-    section_height(1, spacing)
+    section_header_height()
+        .saturating_add(settings_label_row_height(spacing))
         .saturating_add(section_spacing())
         .saturating_add(section_height(rows.max(1), spacing))
         .saturating_add(padding.saturating_mul(2))
@@ -235,7 +257,7 @@ pub fn item_grid<'a, Message: 'static + Clone>(
         .width(Length::Fill)
         .height(Length::Fixed(f32::from(height)))
         .padding([MARGIN_Y, horizontal_padding])
-        .align_x(Alignment::Start)
+        .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .into()
 }
@@ -443,12 +465,12 @@ pub fn notice<'a, Message: 'static>(message: String, height: u16) -> Element<'a,
 
 pub fn settings_list<'a, Message: 'static>(
     list: impl Into<Element<'a, Message>>,
-    height: u16,
+    max_height: u16,
     padding: u16,
 ) -> Element<'a, Message> {
     container(scrollable(list.into()).direction(hidden_scroll()))
         .width(Length::Fill)
-        .height(Length::Fixed(f32::from(height)))
+        .max_height(f32::from(max_height))
         .padding([padding, MARGIN_X])
         .into()
 }
@@ -658,8 +680,24 @@ mod tests {
     fn the_settings_list_is_as_tall_as_the_rows_it_holds() {
         assert_eq!(
             settings_body_height(3, 4, 12),
-            section_height(1, 4) + section_spacing() + section_height(3, 4) + 24
+            section_header_height()
+                + settings_label_row_height(4)
+                + section_spacing()
+                + section_height(3, 4)
+                + 24
         );
+    }
+
+    #[test]
+    fn a_preference_row_leaves_room_for_a_label_that_wraps() {
+        assert_eq!(settings_label_height(), BODY_LINE * SETTINGS_LABEL_LINES);
+        assert!(settings_label_row_height(4) > list_row_height(4));
+        assert_eq!(settings_label_row_height(4), settings_label_height() + 8);
+    }
+
+    #[test]
+    fn a_preference_row_is_never_shorter_than_the_rows_below_it() {
+        assert!(settings_label_row_height(0) >= LIST_MIN_ROW);
     }
 
     #[test]
@@ -675,6 +713,13 @@ mod tests {
     fn the_outer_margins_do_not_follow_the_density() {
         assert_eq!(MARGIN_X, 16);
         assert_eq!(MARGIN_Y, 12);
+    }
+
+    #[test]
+    fn a_row_keeps_the_same_inset_whatever_the_density_does() {
+        assert_eq!(LIST_ROW_INSET, 16, "the compact space_m, held still");
+        assert_eq!(list_row_padding(4), [4, LIST_ROW_INSET]);
+        assert_eq!(list_row_padding(12), [12, LIST_ROW_INSET]);
     }
 
     #[test]

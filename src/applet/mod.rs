@@ -385,6 +385,36 @@ impl StatusHub {
         .into()
     }
 
+    fn settings_section<'a>() -> settings::Section<'a, Message> {
+        settings::section::with_column(
+            list::list_column()
+                .list_item_padding(popup::list_row_padding(popup::list_row_spacing())),
+        )
+    }
+
+    fn settings_toggle_row<'a>(
+        label: String,
+        toggled: bool,
+        on_toggle: impl Fn(bool) -> Message + 'static,
+    ) -> list::ListButton<'a, Message> {
+        let on_press = on_toggle(!toggled);
+        let row = cosmic::widget::row::with_children(vec![
+            text::body(label)
+                .width(Length::Fill)
+                .height(Length::Fixed(f32::from(popup::settings_label_height())))
+                .align_y(cosmic::iced::Alignment::Center)
+                .into(),
+            cosmic::widget::toggler(toggled)
+                .width(Length::Shrink)
+                .on_toggle(on_toggle)
+                .into(),
+        ])
+        .align_y(cosmic::iced::Alignment::Center)
+        .spacing(cosmic::theme::spacing().space_xs);
+
+        list::button(row).on_press(on_press)
+    }
+
     fn settings_drag_preview(
         handle: icon::Handle,
         size: u16,
@@ -400,7 +430,7 @@ impl StatusHub {
 
         cosmic::widget::container(content)
             .width(Length::Fill)
-            .padding(cosmic::applet::menu_control_padding())
+            .padding(popup::list_row_padding(popup::list_row_spacing()))
             .align_y(cosmic::iced::Alignment::Center)
             .class(cosmic::theme::Container::List)
             .into()
@@ -526,20 +556,22 @@ impl StatusHub {
             false,
             self.appearance.colour_icons(),
         );
-        let spacing = popup::list_row_spacing();
         let rows = self.settings_rows();
-        let height = popup::settings_body_height(rows.len(), spacing, popup::MARGIN_Y);
 
-        let appearance = settings::section().title(fl!("appearance")).add(
-            settings::item::builder(fl!("colour-icons")).toggler(
-                self.draft_appearance
-                    .unwrap_or(self.appearance)
-                    .colour_icons(),
-                Message::ToggleColourIcons,
-            ),
+        let colour_icons = self
+            .draft_appearance
+            .unwrap_or(self.appearance)
+            .colour_icons();
+        let colours = Self::settings_toggle_row(
+            fl!("colour-icons"),
+            colour_icons,
+            Message::ToggleColourIcons,
         );
+        let appearance = Self::settings_section()
+            .title(fl!("appearance"))
+            .add(colours);
 
-        let tray = settings::section().title(fl!("tray-icons"));
+        let tray = Self::settings_section().title(fl!("tray-icons"));
         let tray = if rows.is_empty() {
             tray.add(text::body(fl!("empty-state")))
         } else {
@@ -551,7 +583,7 @@ impl StatusHub {
             .width(Length::Fill)
             .spacing(popup::section_spacing());
 
-        popup::settings_list(list, height, popup::MARGIN_Y)
+        popup::settings_list(list, popup::settings_body_max_height(), popup::MARGIN_Y)
     }
 
     fn drag_over(&mut self, target: &crate::core::model::ItemKey) -> Task<Message> {
