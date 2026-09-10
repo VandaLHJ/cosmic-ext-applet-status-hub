@@ -77,6 +77,16 @@
     <keyword>Panel</keyword>
   </keywords>
   <releases>
+    <release type="stable" version="1.5.6" date="2026-09-10">
+      <description>
+        <p>This maintenance release keeps Status Hub aligned with COSMIC Epoch 1.8 and the latest libcosmic APIs.</p>
+        <ul>
+          <li>Updates libcosmic, COSMIC panel configuration and their Rust dependency graph.</li>
+          <li>Refreshes the vendored Flatpak sources so offline builds use the same dependency revisions.</li>
+          <li>Updates the GitHub Actions checkout integration used by continuous integration and releases.</li>
+        </ul>
+      </description>
+    </release>
     <release type="stable" version="1.5.5" date="2026-09-10">
       <description>
         <p>Tray icons now retain their detail more reliably across themes and panel sizes.</p>
