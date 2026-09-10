@@ -39,6 +39,11 @@ pub fn png_at(path: &Path, image: &RgbaImage) {
 pub fn test_theme(ink: [u8; 3]) -> ThemeContext {
     ThemeContext {
         ink,
+        background: if ink.iter().map(|&channel| u16::from(channel)).sum::<u16>() >= 384 {
+            DARK_PANEL_BASE
+        } else {
+            LIGHT_PANEL_BASE
+        },
         icon_theme: "test".to_owned(),
         colour_icons: true,
     }
@@ -82,8 +87,6 @@ pub fn alphas(image: &RgbaImage) -> Vec<u8> {
         .map(|p| p[3])
         .collect()
 }
-
-pub const ROUND_TRIP_SLACK: f32 = 0.01;
 
 pub const DARK_PANEL_BASE: [u8; 3] = [27, 27, 27];
 

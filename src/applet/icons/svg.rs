@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::path::Path;
 
 use resvg::tiny_skia::{Pixmap, Transform};
@@ -6,13 +5,9 @@ use resvg::usvg;
 
 use crate::core::icons::RgbaImage;
 
-use super::paint::{MIN_ALPHA, MIN_LIGHTNESS_SPAN, lightness_of, straighten};
+use super::raster::straighten;
 
 const MAX_SVG_BYTES: u64 = 256 * 1024;
-
-const INSPECT_SIZE: u16 = 32;
-
-const MAX_CHROMA: u8 = 8;
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn render_svg(path: &Path, size: u16) -> Option<RgbaImage> {
@@ -48,79 +43,17 @@ pub fn render_svg(path: &Path, size: u16) -> Option<RgbaImage> {
     })
 }
 
-pub fn single_ink_svg(path: &Path) -> bool {
-    if path.extension() != Some(OsStr::new("svg"))
-        || std::fs::metadata(path).is_ok_and(|meta| meta.len() > MAX_SVG_BYTES)
-    {
-        return false;
-    }
-
-    let Ok(source) = std::fs::read_to_string(path) else {
-        return false;
-    };
-
-    if source.contains("<image") || source.contains("data:image/") {
-        return false;
-    }
-
-    rendered_ink(source.as_bytes()).is_none_or(|ink| ink.is_single())
-}
-
-struct RenderedInk {
-    span: f32,
-    chroma: u8,
-}
-
-impl RenderedInk {
-    fn is_single(&self) -> bool {
-        self.chroma <= MAX_CHROMA && self.span < MIN_LIGHTNESS_SPAN
-    }
-}
-
-fn rendered_ink(source: &[u8]) -> Option<RenderedInk> {
-    let tree = usvg::Tree::from_data(source, &usvg::Options::default()).ok()?;
-    let size = tree.size();
-    let scale = f32::from(INSPECT_SIZE) / size.width().max(size.height()).max(1.0);
-    let mut pixmap = Pixmap::new(u32::from(INSPECT_SIZE), u32::from(INSPECT_SIZE))?;
-    resvg::render(
-        &tree,
-        Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
-
-    let mut span: Option<(f32, f32)> = None;
-    let mut chroma = 0u8;
-    for pixel in pixmap.pixels() {
-        let alpha = pixel.alpha();
-        if alpha < MIN_ALPHA {
-            continue;
-        }
-        let colour = [
-            straighten(pixel.red(), alpha),
-            straighten(pixel.green(), alpha),
-            straighten(pixel.blue(), alpha),
-        ];
-        let low = colour[0].min(colour[1]).min(colour[2]);
-        let high = colour[0].max(colour[1]).max(colour[2]);
-        chroma = chroma.max(high - low);
-
-        let level = lightness_of(colour);
-        span = Some(match span {
-            Some((low, high)) => (low.min(level), high.max(level)),
-            None => (level, level),
-        });
-    }
-
-    span.map(|(low, high)| RenderedInk {
-        span: high - low,
-        chroma,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::applet::icons::testing::*;
+
+    fn is_monotone(path: &Path) -> bool {
+        render_svg(path, 16).is_some_and(|mut image| {
+            super::super::paint::recolour(&mut image, &light_panel(), false)
+                == super::super::paint::PaintDecision::Monotone
+        })
+    }
 
     fn drawn(body: &str) -> String {
         format!(
@@ -135,7 +68,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_ink_svg_is_symbolic_even_without_the_suffix() {
+    fn rendered_neutral_fills_use_the_shared_monotone_classifier() {
         let root = test_root("single-ink");
         let cases = [
             ("black", filled("#000000")),
@@ -160,8 +93,8 @@ mod tests {
 
         for (name, body) in cases {
             assert!(
-                single_ink_svg(&svg_at(&root, name, &body)),
-                "expected {name} to be treated as symbolic"
+                is_monotone(&svg_at(&root, name, &body)),
+                "expected {name} to be treated as monotone"
             );
         }
 
@@ -169,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn two_greyscale_inks_are_preserved() {
+    fn two_neutral_svg_regions_use_the_shared_duotone_classifier() {
         let root = test_root("two-inks");
         let path = svg_at(
             &root,
@@ -180,7 +113,11 @@ mod tests {
             ),
         );
 
-        assert!(!single_ink_svg(&path));
+        let mut image = render_svg(&path, 16).unwrap();
+        assert!(matches!(
+            super::super::paint::recolour(&mut image, &light_panel(), false),
+            super::super::paint::PaintDecision::Duotone { .. }
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -211,14 +148,19 @@ mod tests {
         );
         let rendered = render_svg(&path, 24).expect("the vector renders");
 
-        let painted = super::super::paint::prepare_raster(&rendered, 24, &dark_panel())
-            .expect("the vector is painted");
+        let mut painted = rendered;
+        assert_eq!(
+            super::super::paint::recolour(&mut painted, &dark_panel(), false),
+            super::super::paint::PaintDecision::Monotone,
+        );
+        let painted = super::super::raster::prepare(painted, 24).unwrap();
         let pixels = painted.bytes.as_chunks::<4>().0;
-        let base = pixels[12 * 24 + 8];
-        let badge = pixels[4 * 24 + 20];
+        assert_eq!((painted.width, painted.height), (48, 48));
+        let base = pixels[24 * 48 + 16];
+        let badge = pixels[8 * 48 + 40];
 
         assert_eq!(&base[..3], &dark_panel().ink);
-        assert!(badge[0].saturating_sub(badge[2]) > 60);
+        assert_eq!(badge, [224, 30, 90, 255]);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -230,7 +172,7 @@ mod tests {
              <rect class=\"ColorScheme-Text\" width=\"16\" height=\"16\" fill=\"currentColor\"/>",
         );
 
-        assert!(single_ink_svg(&svg_at(&root, "unused-highlight", &body)));
+        assert!(is_monotone(&svg_at(&root, "unused-highlight", &body)));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -242,12 +184,12 @@ mod tests {
              <rect class=\"ColorScheme-Highlight\" width=\"16\" height=\"16\" fill=\"currentColor\"/>",
         );
 
-        assert!(!single_ink_svg(&svg_at(&root, "used-highlight", &body)));
+        assert!(!is_monotone(&svg_at(&root, "used-highlight", &body)));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn coloured_or_embedded_content_is_not_inferred_as_single_ink() {
+    fn colours_gradients_and_invalid_embedded_content_are_not_monotone() {
         let root = test_root("coloured");
         let cases = [
             ("hex", filled("#4caf50")),
@@ -275,7 +217,7 @@ mod tests {
 
         for (name, body) in cases {
             assert!(
-                !single_ink_svg(&svg_at(&root, name, &body)),
+                !is_monotone(&svg_at(&root, name, &body)),
                 "expected {name} not to be inferred as single ink"
             );
         }
@@ -284,21 +226,21 @@ mod tests {
     }
 
     #[test]
-    fn artwork_that_draws_nothing_is_left_to_the_theme_ink() {
+    fn an_empty_vector_is_not_classified_as_monotone() {
         let root = test_root("empty-vector");
 
-        assert!(single_ink_svg(&svg_at(&root, "blank", "<svg/>")));
+        assert!(!is_monotone(&svg_at(&root, "blank", "<svg/>")));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn a_raster_file_is_never_inferred_as_symbolic() {
+    fn the_svg_renderer_rejects_non_svg_bytes() {
         let root = test_root("raster");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("tray.png");
         std::fs::write(&path, [0u8; 8]).unwrap();
 
-        assert!(!single_ink_svg(&path));
+        assert!(!is_monotone(&path));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -77,9 +77,9 @@ fn best_frame(pixmaps: &[Pixmap], target_px: u32) -> Option<&Pixmap> {
 
     let target = i32::try_from(target_px).unwrap_or(i32::MAX);
     usable()
-        .filter(|frame| frame.width >= target)
-        .min_by_key(|frame| frame.width)
-        .or_else(|| usable().max_by_key(|frame| frame.width))
+        .filter(|frame| frame.width.max(frame.height) >= target)
+        .min_by_key(|frame| frame.width.max(frame.height))
+        .or_else(|| usable().max_by_key(|frame| frame.width.max(frame.height)))
 }
 
 fn decode(frame: &Pixmap) -> RgbaImage {
@@ -207,6 +207,28 @@ mod tests {
     fn an_oversized_request_settles_for_the_largest_frame() {
         let frames = [pixmap(16), pixmap(22)];
         assert_eq!(best_frame(&frames, 256).unwrap().width, 22);
+    }
+
+    #[test]
+    fn portrait_frames_are_selected_by_their_longest_side() {
+        let frames = [
+            Pixmap {
+                width: 12,
+                height: 24,
+                bytes: vec![0; 12 * 24 * 4],
+            },
+            Pixmap {
+                width: 24,
+                height: 48,
+                bytes: vec![0; 24 * 48 * 4],
+            },
+            Pixmap {
+                width: 32,
+                height: 64,
+                bytes: vec![0; 32 * 64 * 4],
+            },
+        ];
+        assert_eq!(best_frame(&frames, 36).unwrap().height, 48);
     }
 
     #[test]

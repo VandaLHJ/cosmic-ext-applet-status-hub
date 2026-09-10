@@ -14,7 +14,7 @@ src/
 │   ├── model.rs ordering.rs menu.rs       wire types, stable order, dbusmenu
 │   └── call.rs proxies.rs icons.rs        timeouts, zbus proxies, icon options
 ├── applet/     the COSMIC applet: iced views and presentation state
-│   ├── icons/  mod.rs (lookup + cache), paint.rs (raster), svg.rs (vector)
+│   ├── icons/  mod.rs (lookup + cache), paint.rs (classification + tint), raster.rs (preparation), svg.rs (rendering)
 │   ├── pins.rs order.rs identity.rs       panel pins, drag order, window matching
 │   └── popup.rs menu_view.rs wayland.rs   surfaces, menus, privileged socket
 ├── testkit/    fakes that run on a real throwaway bus (feature = "testkit")
@@ -200,7 +200,7 @@ The lookup runs in a fixed order (`applet/icons/mod.rs`):
 2. the name under the item's own `IconThemePath`, accepted only if the result really lives there;
 3. the absolute path the item published, if the value is a path and the file exists;
 4. the raw pixmap, ARGB converted to RGBA, choosing the smallest frame at least as large as the
-   target and otherwise the largest available;
+   2× logical target and otherwise the largest available, comparing the longest side;
 5. `application-default`, then `application-x-executable`.
 
 A relative name and an absolute path are mutually exclusive readings of `IconName`, so step 3 is a
@@ -216,6 +216,14 @@ keyed by `(address, generation, kind, size)`, so a fresh resolve invalidates an 
 explicit invalidation anywhere; a change of icon theme, panel colours, or the user's colouring
 preference clears it outright.
 
+The cache also resolves `OverlayIcon*` at half the primary icon's logical size. Overlays keep
+their published colours, except explicitly symbolic icons which use the panel ink. Missing or
+malformed overlay files fall through to a published pixmap, never a generic placeholder. Missing
+overlays are cached until the next item generation; they do not start the primary fallback retry
+ladder. Panel buttons, popup items, settings rows and drag previews all use the same composition:
+the primary icon with a half-size overlay at the bottom right. Each layer fits proportionally
+inside its square, preserving the artwork's aspect ratio.
+
 ### Reaching another sandbox's artwork
 
 Steps 2 and 3 also resolve paths this process cannot read (`src/flatpak.rs`). An application in a
@@ -228,49 +236,65 @@ application (30 of 31 on the machine this was measured on) and serving the wrong
 than serving none. The branch only runs when the published path does not exist, so it is inert
 outside a sandbox.
 
-### Painting
+### Preparing and painting icons
 
-By default every icon is painted to the panel's foreground ink. The tray is a row of glyphs beside
-the clock and the battery, not a row of application logos, and an icon left in its published colours
-can be legible on one theme and invisible on the other. Users who prefer application artwork can
-disable this painting; ordinary raster and vector icons then keep their published colours, while
-explicit symbolic icons and generic fallbacks still follow the panel so they remain legible.
+Image preparation does not depend on the colouring preference or painting eligibility. SVGs are
+rendered once with resvg at twice the logical size, retaining their aspect ratio. PNGs and SNI
+pixmaps are decoded at source resolution. All successfully decoded artwork goes through the same
+RGBA pipeline: optional painting, then reduction to at most twice the logical size. Smaller rasters
+are not enlarged. Catmull-Rom filtering uses premultiplied alpha, and presentation uses proportional
+containment. `applet/icons/raster.rs` owns loading, validation, alpha conversion and resizing;
+`svg.rs` only rasterizes vectors.
 
-A raster is analysed in Oklab (`applet/icons/paint.rs`). Art larger than the panel size is shrunk
-first — the tone analysis reads the same shape either way, and a 256×256 pixmap costs about 0.8 ms
-to paint instead of 6.4 ms, which matters because painting happens inside `view()`. The lightness
-span is measured over the opaque core, the pixels at nine tenths of the artwork's own peak alpha or
-above, because antialiasing is coverage rather than content and should not vote on how the artwork
-reads. Its fifth and ninety-fifth percentiles define the usable range so isolated highlights or
-shadows cannot flatten the rest of the icon.
+The existing colouring preference enables conservative automatic classification in
+`applet/icons/paint.rs`. Only neutral monotones and simple duotones qualify; coloured artwork,
+complex contours and uncertain classifications keep their original pixels before resizing. A
+single blue or red ink is still coloured artwork. Explicit `-symbolic` names and generic fallbacks
+always follow the theme, including when automatic painting is disabled. Successfully prepared
+symbolics contain their final colours in RGBA and must not receive another renderer-side tint.
+Artwork that cannot be prepared keeps its original handle; malformed overlays fall through to
+their pixmap or remain absent, never becoming a generic placeholder.
 
-Below `MIN_LIGHTNESS_SPAN` the artwork is a silhouette and every pixel becomes the ink exactly.
-Above it, each pixel keeps its relative lightness, **anchored at the end nearest the ink**: the
-lightest tone lands on the ink on a dark panel, the darkest does on a light one, and everything else
-travels away from the panel by at most `MAX_TINT_SHIFT`. The direction is the whole point. Shading
-centred on the ink runs both ways, so on a dark panel the dark half of the artwork sinks toward the
-background and on a light panel the light half washes out — which is exactly the detail the artwork
-was drawn to show. Anchoring means no tone can move toward the panel past a fixed budget, and
-`TINT_GAIN` keeps most of the original separation within that budget rather than
-stretching every icon to fill it. Hue and chroma come from the ink, so a coloured foreground stays
-that colour instead of drifting as it lightens. Recolouring never changes alpha, cutouts and
-antialiasing included; the resize that follows smooths alpha alone.
+Classification happens before raster reduction and is independent of the theme. Visible samples
+have alpha at least 16, including translucent outlines. A channel spread of at most 16 is neutral;
+intensity is integer RGB luminance with weights 54/183/19 over 256. A span at most 24 is monotone.
+Otherwise, at least 98% of the alpha mass must be within 12 levels of the two extremes to qualify
+directly as a duotone. If this fails, locally solid 3×3 neighbourhoods identify the actual inks.
+At least 98% of that solid mass must still fit one or two tones. Remaining samples can count as
+antialiasing only within two source pixels of both inks, or of an ink and transparency for a
+monotone. The resulting supported samples must cover at least 98% of the full alpha mass.
+This admits thin smoothed transitions without admitting broad gradients or unrelated shading.
 
-A vector is symbolic outright when its name ends in `-symbolic`. Otherwise it is rendered to 32×32
-and measured the same way (`applet/icons/svg.rs`): one achromatic ink means symbolic, while detailed
-artwork is rendered at twice its requested size and sent through the same Oklab painter as raster
-artwork. Rendering rather than reading the markup is deliberate — resvg is the renderer iced already
-draws these files with, so the measurement is of what will actually appear, and CSS, dead style
-rules, gradients and masks need no parser of our own. A file whose markup embeds a raster is not
-inferred as symbolic; a file that draws nothing is treated as a single ink.
+Before this antialiasing allowance, scanlines in both axes protect contours using all visible
+samples, including translucent outlines. Transparency and the badge analysis mask break runs;
+intermediate antialiasing samples do not add transitions. A run is complex when it has at least
+three transitions, or when a secondary tone surrounds the dominant tone with a separation
+greater than 48. An icon stays original if complex runs occur on more than 20% of the visible
+scanlines in either axis. A simple detail inside the dominant fill is not itself a border,
+and isolated intersections do not reject an otherwise simple drawing. Transparent padding does
+not dilute this ratio. These fixed heuristics intentionally favour preservation in uncertain cases.
 
-A compact chromatic region touching an image edge is treated as a badge. Its mask is the intersection
-of the row and column spans of its coloured pixels rather than a rectangular bounding box, so it
-does not consume nearby pixels from the icon body. A separate analysis mask extends one pixel around
-the badge so its neutral outline and antialiasing cannot distort the tone profile of the icon body;
-that margin is not painted as part of the badge. Badge pixels keep eighty percent of their published
-Oklab colour and receive twenty percent of the panel ink, retaining the accent while its body and
-edge read as part of the themed icon.
+Monotones receive the foreground ink exactly. In duotones the endpoint with more alpha mass gets
+the foreground; ties favour the lighter endpoint. The other endpoint receives 70% foreground and
+30% background, mixed directly in RGB with integer rounding. Intermediate intensities interpolate
+between these colours. There is no Oklab profile, adaptive contrast search or theme-dependent
+classification. Foreground and background remain part of cache invalidation. Painting keeps
+alpha exactly, and transparent pixels remain untouched; only subsequent resampling can change
+coverage.
+
+A compact chromatic region touching the visible artwork's edge is treated as an embedded badge.
+Transparent padding does not affect this edge test. The preserved mask is the intersection of
+row and column spans of coloured pixels, including neutral details enclosed by those spans.
+Its analysis mask extends one pixel to exclude the badge's outline and antialiasing from base
+classification; that extra margin is not part of the preserved mask. Detected badge pixels keep
+their original RGBA, including when an explicit symbolic base is painted. A coloured badge does
+not disqualify a neutral base. Detection remains a heuristic because a published bitmap does not
+identify notification pixels semantically. Separate SNI overlays retain their independent
+composition and colour policy.
+
+The internal painting decision records original-with-reason, symbolic, monotone or duotone.
+Resolution logs report that decision separately from whether a raster handle was prepared;
+successful rasterization alone no longer means an icon was recoloured.
 
 ## Raising the window a tray item stands for
 

@@ -28,10 +28,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::APP_ID;
-use crate::applet::icons::IconCache;
+use crate::applet::icons::{IconCache, TrayIcon, overlay_size};
 use crate::applet::message::Message;
 use crate::applet::wayland::{ActivateRequest, Raise, TokenRequest, WaylandRequest, WaylandUpdate};
-use crate::core::icons::IconKind;
 use crate::core::menu::MenuModel;
 use crate::core::model::{ItemAddress, TraySnapshot, WatcherState};
 use crate::core::{CoreCommand, CoreHandle};
@@ -312,12 +311,11 @@ impl StatusHub {
         let handle = self
             .icons
             .borrow()
-            .get(&item.address, item.generation, IconKind::Primary, size)
-            .cloned();
+            .item(&item.address, item.generation, size);
 
         let button = match handle {
             Some(handle) => self
-                .applet_button(Self::icon_glyph(handle, size))
+                .applet_button(Self::item_glyph(handle, size))
                 .force_enabled(true),
             None => self
                 .applet_button(text(item.label().to_owned()))
@@ -353,6 +351,23 @@ impl StatusHub {
             })
             .width(Length::Fixed(size))
             .height(Length::Fixed(size))
+            .content_fit(cosmic::iced::ContentFit::Contain)
+            .into()
+    }
+
+    fn item_glyph<'a, M: 'a>(icon: TrayIcon, size: u16) -> Element<'a, M> {
+        let base = Self::icon_glyph(icon.primary, size);
+        let Some(overlay) = icon.overlay else {
+            return base;
+        };
+        let badge = cosmic::widget::container(Self::icon_glyph(overlay, overlay_size(size)))
+            .width(Length::Fixed(f32::from(size)))
+            .height(Length::Fixed(f32::from(size)))
+            .align_x(cosmic::iced::Alignment::End)
+            .align_y(cosmic::iced::Alignment::End);
+        cosmic::iced::widget::Stack::new()
+            .push(base)
+            .push(badge)
             .into()
     }
 
@@ -366,14 +381,14 @@ impl StatusHub {
     }
 
     fn settings_row_content<'a, M: 'a + 'static>(
-        handle: icon::Handle,
+        handle: TrayIcon,
         size: u16,
         label: String,
         toggler: Element<'a, M>,
     ) -> Element<'a, M> {
         cosmic::widget::row::with_children(vec![
             Self::drag_grip(),
-            Self::icon_glyph(handle, size),
+            Self::item_glyph(handle, size),
             text::body(label)
                 .width(Length::Fill)
                 .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
@@ -416,7 +431,7 @@ impl StatusHub {
     }
 
     fn settings_drag_preview(
-        handle: icon::Handle,
+        handle: TrayIcon,
         size: u16,
         label: String,
         pinned: bool,
@@ -630,14 +645,11 @@ impl StatusHub {
         let handle = self
             .icons
             .borrow()
-            .get(
-                &item.address,
-                item.generation,
-                IconKind::Primary,
-                self.item_icon_size(),
-            )
-            .cloned()
-            .unwrap_or_else(|| icon::from_name("application-default").size(size).handle());
+            .item(&item.address, item.generation, self.item_icon_size())
+            .unwrap_or_else(|| TrayIcon {
+                primary: icon::from_name("application-default").size(size).handle(),
+                overlay: None,
+            });
 
         let toggle_key = key.clone();
         let row = Self::settings_row_content(

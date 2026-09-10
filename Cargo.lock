@@ -940,7 +940,6 @@ dependencies = [
  "i18n-embed-fl",
  "image",
  "libcosmic",
- "palette",
  "resvg",
  "rust-embed",
  "serde",

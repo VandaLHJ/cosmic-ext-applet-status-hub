@@ -8,16 +8,14 @@ use crate::core::icons::{IconKind, IconOptions, RgbaImage, resolve};
 use crate::core::model::{Generation, ItemAddress, TraySnapshot};
 
 mod paint;
+mod raster;
 mod svg;
 #[cfg(test)]
 mod testing;
 
-use self::paint::prepare_raster;
-use self::svg::{render_svg, single_ink_svg};
+use self::paint::recolour;
 
 const FALLBACKS: [&str; 2] = ["application-default", "application-x-executable"];
-
-const MAX_RASTER_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
@@ -29,8 +27,18 @@ struct Key {
 
 #[derive(Debug)]
 struct Entry {
-    handle: icon::Handle,
+    handle: Option<icon::Handle>,
     fallback: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrayIcon {
+    pub primary: icon::Handle,
+    pub overlay: Option<icon::Handle>,
+}
+
+pub const fn overlay_size(size: u16) -> u16 {
+    size.div_ceil(2)
 }
 
 #[derive(Debug, Default)]
@@ -63,44 +71,71 @@ impl IconCache {
         }
         let theme = &self.theme;
 
-        let mut next = HashMap::with_capacity(snapshot.items.len());
+        let overlay_theme = ThemeContext {
+            colour_icons: false,
+            ..theme.clone()
+        };
+        let mut next = HashMap::with_capacity(snapshot.items.len() * 2);
         let mut unresolved_primary = false;
 
-        let kind = IconKind::Primary;
         for item in &snapshot.items {
-            let key = Key {
-                address: item.address.clone(),
-                generation: item.generation,
-                kind,
-                size,
-            };
-            let entry = match self.entries.remove(&key) {
-                Some(entry) if !entry.fallback || !retry_fallbacks => entry,
-                _ => {
-                    let options = resolve(&item.icon, item.status, kind, u32::from(size));
-                    let built = build(&options, size, theme);
-                    tracing::info!(
-                        item = %item.id,
-                        ?kind,
-                        size,
-                        name = options.name.as_deref().unwrap_or("-"),
-                        theme_path = options.theme_path.as_deref().unwrap_or("-"),
-                        pixmap = options.pixels.is_some(),
-                        source = %built.source,
-                        symbolic = built.handle.symbolic,
-                        paint = built.paint,
-                        "icon resolved"
-                    );
-                    Entry {
-                        handle: built.handle,
-                        fallback: built.fallback,
+            for kind in [IconKind::Primary, IconKind::Overlay] {
+                let key = Key {
+                    address: item.address.clone(),
+                    generation: item.generation,
+                    kind,
+                    size,
+                };
+                let entry = match self.entries.remove(&key) {
+                    Some(entry) if !entry.fallback || !retry_fallbacks => entry,
+                    _ => {
+                        let draw_size = if kind == IconKind::Overlay {
+                            overlay_size(size)
+                        } else {
+                            size
+                        };
+                        let options = resolve(
+                            &item.icon,
+                            item.status,
+                            kind,
+                            u32::from(draw_size).max(1) * 2,
+                        );
+                        let built = if kind == IconKind::Overlay {
+                            build_artwork(&options, draw_size, &overlay_theme, kind)
+                        } else {
+                            Some(build(&options, draw_size, theme))
+                        };
+                        if let Some(built) = built {
+                            tracing::info!(
+                                item = %item.id,
+                                ?kind,
+                                size,
+                                name = options.name.as_deref().unwrap_or("-"),
+                                theme_path = options.theme_path.as_deref().unwrap_or("-"),
+                                pixmap = options.pixels.is_some(),
+                                source = %built.source,
+                                symbolic = built.handle.symbolic,
+                                paint = built.paint,
+                                rasterized = matches!(&built.handle.data, icon::Data::Image(_)),
+                                "icon resolved"
+                            );
+                            Entry {
+                                handle: Some(built.handle),
+                                fallback: built.fallback,
+                            }
+                        } else {
+                            Entry {
+                                handle: None,
+                                fallback: false,
+                            }
+                        }
                     }
+                };
+                if entry.fallback {
+                    unresolved_primary = true;
                 }
-            };
-            if entry.fallback {
-                unresolved_primary = true;
+                next.insert(key, entry);
             }
-            next.insert(key, entry);
         }
 
         self.entries = next;
@@ -121,7 +156,23 @@ impl IconCache {
                 kind,
                 size,
             })
-            .map(|entry| &entry.handle)
+            .and_then(|entry| entry.handle.as_ref())
+    }
+
+    pub fn item(
+        &self,
+        address: &ItemAddress,
+        generation: Generation,
+        size: u16,
+    ) -> Option<TrayIcon> {
+        Some(TrayIcon {
+            primary: self
+                .get(address, generation, IconKind::Primary, size)?
+                .clone(),
+            overlay: self
+                .get(address, generation, IconKind::Overlay, size)
+                .cloned(),
+        })
     }
 }
 
@@ -139,10 +190,22 @@ enum Origin {
 }
 
 fn build(options: &IconOptions, size: u16, theme: &ThemeContext) -> Built {
+    build_artwork(options, size, theme, IconKind::Primary).unwrap_or_else(|| fallback(size, theme))
+}
+
+fn build_artwork(
+    options: &IconOptions,
+    size: u16,
+    theme: &ThemeContext,
+    kind: IconKind,
+) -> Option<Built> {
+    let file = |path: PathBuf, name: &str, source| from_file(path, name, source, size, theme, kind);
     if let Some(name) = &options.name {
         if let Some(path) = lookup(name, size) {
             let source = format!("name {name} -> {}", path.display());
-            return from_file(path, name, Origin::Published, source, size, theme);
+            if let Some(built) = file(path, name, source) {
+                return Some(built);
+            }
         }
 
         if let Some((path, origin)) = options
@@ -151,7 +214,9 @@ fn build(options: &IconOptions, size: u16, theme: &ThemeContext) -> Built {
             .and_then(|root| lookup_published(name, root, size))
         {
             let source = format!("{} name {name} -> {}", origin.label(), path.display());
-            return from_file(path, name, origin, source, size, theme);
+            if let Some(built) = file(path, name, source) {
+                return Some(built);
+            }
         }
     }
 
@@ -159,41 +224,43 @@ fn build(options: &IconOptions, size: u16, theme: &ThemeContext) -> Built {
         && let Some((path, origin)) = resolve_path(published)
     {
         let source = format!("{} path {}", origin.label(), path.display());
-        return from_file(path, "", origin, source, size, theme);
+        if let Some(built) = file(path, "", source) {
+            return Some(built);
+        }
     }
 
     if let Some(published) = &options.pixels {
-        let recoloured = theme
-            .colour_icons
-            .then(|| prepare_raster(published, size, theme))
-            .flatten();
-        let note = if recoloured.is_some() {
-            " recoloured"
-        } else {
-            ""
-        };
-        let image = recoloured.as_ref().unwrap_or(published.as_ref());
-        let source = format!("pixmap {}x{}{note}", image.width, image.height);
-        return Built {
-            handle: icon::from_raster_pixels(image.width, image.height, image.bytes.clone()),
-            source,
+        let explicit = options
+            .name
+            .as_deref()
+            .is_some_and(|name| name.ends_with("-symbolic"));
+        let (handle, paint) = prepared_handle(published.as_ref().clone(), size, theme, explicit)?;
+        return Some(Built {
+            handle,
+            source: format!("pixmap {}x{}", published.width, published.height),
             fallback: false,
-            paint: if recoloured.is_some() {
-                "pixmap-recoloured"
-            } else {
-                "original"
-            },
-        };
+            paint,
+        });
     }
 
+    None
+}
+
+fn fallback(size: u16, theme: &ThemeContext) -> Built {
     for fallback in FALLBACKS {
         if let Some(path) = lookup(fallback, size) {
             let source = format!("GENERIC {fallback} -> {}", path.display());
-            let (mut handle, mut paint) = handle_for(path, fallback, size, theme);
-            if !theme.colour_icons {
-                handle.symbolic = true;
-                paint = "symbolic-fallback";
-            }
+            let handle = raster::load(&path, size)
+                .and_then(|image| prepared_handle(image, size, theme, true))
+                .map_or_else(
+                    || {
+                        let mut handle = icon::from_path(path);
+                        handle.symbolic = true;
+                        handle
+                    },
+                    |(handle, _)| handle,
+                );
+            let paint = "symbolic-fallback";
             return Built {
                 handle,
                 source,
@@ -210,25 +277,61 @@ fn build(options: &IconOptions, size: u16, theme: &ThemeContext) -> Built {
             .handle(),
         source: "GENERIC unresolved".to_owned(),
         fallback: true,
-        paint: "original",
+        paint: "symbolic-fallback",
     }
 }
 
 fn from_file(
     path: PathBuf,
     name: &str,
-    origin: Origin,
     source: String,
     size: u16,
     theme: &ThemeContext,
-) -> Built {
-    let (handle, paint) = handle_from(path, name, origin, size, theme);
-    Built {
+    kind: IconKind,
+) -> Option<Built> {
+    let explicit = name.ends_with("-symbolic")
+        || path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .is_some_and(|stem| stem.ends_with("-symbolic"));
+    let (handle, paint) = if let Some(prepared) =
+        raster::load(&path, size).and_then(|image| prepared_handle(image, size, theme, explicit))
+    {
+        prepared
+    } else if kind == IconKind::Overlay {
+        return None;
+    } else {
+        let mut handle = icon::from_path(path);
+        handle.symbolic = explicit;
+        (
+            handle,
+            if explicit {
+                "symbolic-explicit"
+            } else {
+                "original-unprocessed"
+            },
+        )
+    };
+    Some(Built {
         handle,
         source,
         fallback: false,
         paint,
-    }
+    })
+}
+
+fn prepared_handle(
+    mut image: RgbaImage,
+    size: u16,
+    theme: &ThemeContext,
+    explicit: bool,
+) -> Option<(icon::Handle, &'static str)> {
+    let decision = recolour(&mut image, theme, explicit);
+    let image = raster::prepare(image, size)?;
+    Some((
+        icon::from_raster_pixels(image.width, image.height, image.bytes),
+        decision.label(),
+    ))
 }
 
 impl Origin {
@@ -293,6 +396,7 @@ fn named(name: &str) -> Named {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ThemeContext {
     ink: [u8; 3],
+    background: [u8; 3],
     icon_theme: String,
     colour_icons: bool,
 }
@@ -301,100 +405,13 @@ fn theme_context(colour_icons: bool) -> ThemeContext {
     let theme = cosmic::theme::active();
     let container = theme.cosmic().background(theme.transparent);
     let ink = container.on.into_format::<u8, u8>();
+    let background = container.base.into_format::<u8, u8>();
     ThemeContext {
         ink: [ink.red, ink.green, ink.blue],
+        background: [background.red, background.green, background.blue],
         icon_theme: cosmic::icon_theme::default(),
         colour_icons,
     }
-}
-
-fn handle_from(
-    path: PathBuf,
-    name: &str,
-    origin: Origin,
-    size: u16,
-    theme: &ThemeContext,
-) -> (icon::Handle, &'static str) {
-    if theme.colour_icons
-        && let Some(image) = raster(&path)
-        && let Some(recoloured) = prepare_raster(&image, size, theme)
-    {
-        return (
-            icon::from_raster_pixels(recoloured.width, recoloured.height, recoloured.bytes),
-            if origin == Origin::Payload {
-                "payload-recoloured"
-            } else {
-                "published-recoloured"
-            },
-        );
-    }
-    handle_for(path, name, size, theme)
-}
-
-fn raster(path: &Path) -> Option<RgbaImage> {
-    if path.extension() == Some(OsStr::new("svg"))
-        || !std::fs::metadata(path).is_ok_and(|meta| meta.len() <= MAX_RASTER_BYTES)
-    {
-        return None;
-    }
-
-    let decoded = image::open(path).ok()?.into_rgba8();
-    Some(RgbaImage {
-        width: decoded.width(),
-        height: decoded.height(),
-        bytes: decoded.into_raw(),
-    })
-}
-
-fn handle_for(
-    path: PathBuf,
-    name: &str,
-    size: u16,
-    theme: &ThemeContext,
-) -> (icon::Handle, &'static str) {
-    let explicit = name.ends_with("-symbolic")
-        || path
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .is_some_and(|stem| stem.ends_with("-symbolic"));
-    if !theme.colour_icons {
-        let mut handle = icon::from_path(path);
-        handle.symbolic = explicit;
-        return (
-            handle,
-            if explicit {
-                "symbolic-explicit"
-            } else {
-                "original"
-            },
-        );
-    }
-
-    let vector = path.extension() == Some(OsStr::new("svg"));
-    let inferred = !explicit && single_ink_svg(&path);
-    if vector
-        && !explicit
-        && !inferred
-        && let Some(image) = render_svg(&path, size)
-        && let Some(recoloured) = prepare_raster(&image, size, theme)
-    {
-        return (
-            icon::from_raster_pixels(recoloured.width, recoloured.height, recoloured.bytes),
-            "tinted-detailed",
-        );
-    }
-    let mut handle = icon::from_path(path);
-    handle.symbolic |= explicit || inferred || vector;
-    let paint = if explicit {
-        "symbolic-explicit"
-    } else if inferred {
-        "symbolic-inferred"
-    } else if vector {
-        "symbolic-painted"
-    } else {
-        "original"
-    };
-    (handle, paint)
 }
 
 #[cfg(test)]
@@ -403,6 +420,264 @@ mod tests {
     use crate::applet::icons::testing::*;
     use crate::core::model::Pixmap;
     use crate::core::testing::item;
+
+    #[test]
+    fn png_and_pixmap_preparation_is_independent_of_the_paint_decision() {
+        let root = test_root("unified-raster");
+        for (name, colour) in [
+            ("neutral", [200, 200, 200, 255]),
+            ("coloured", [20, 100, 200, 255]),
+        ] {
+            let image = RgbaImage {
+                width: 120,
+                height: 60,
+                bytes: colour.repeat(120 * 60),
+            };
+            let path = root.join(format!("{name}.png"));
+            png_at(&path, &image);
+            for size in [18, 22, 24] {
+                for theme in [light_panel(), dark_panel(), original_icons()] {
+                    let from_path = test_file(path.clone(), name, size, &theme);
+                    let from_pixels = prepared_handle(image.clone(), size, &theme, false).unwrap();
+                    assert_eq!(from_path.1, from_pixels.1);
+                    assert_eq!(raster_pixels(&from_path.0), raster_pixels(&from_pixels.0));
+                    let (width, height, pixels) = raster_pixels(&from_path.0);
+                    assert_eq!((width, height), (u32::from(size) * 2, u32::from(size)));
+                    let expected = if name == "neutral" && theme.colour_icons {
+                        theme.ink
+                    } else {
+                        [colour[0], colour[1], colour[2]]
+                    };
+                    assert_eq!(&pixels[..3], &expected);
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn svg_preparation_keeps_resolution_and_aspect_when_paint_is_disabled_or_rejected() {
+        let root = test_root("unified-svg");
+        for (name, fill) in [("neutral", "#cccccc"), ("coloured", "#1464c8")] {
+            let path = svg_at(
+                &root,
+                name,
+                &format!(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 12\"><rect width=\"24\" height=\"12\" fill=\"{fill}\"/></svg>"
+                ),
+            );
+            for size in [18, 22, 24] {
+                for theme in [light_panel(), dark_panel(), original_icons()] {
+                    let (handle, policy) = test_file(path.clone(), name, size, &theme);
+                    let (width, height, _) = raster_pixels(&handle);
+                    assert_eq!((width, height), (u32::from(size) * 2, u32::from(size)));
+                    let expected = if !theme.colour_icons {
+                        "original-disabled"
+                    } else if name == "neutral" {
+                        "monotone"
+                    } else {
+                        "original-coloured"
+                    };
+                    assert_eq!(policy, expected);
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn original_overlays_are_resized_independently_of_the_primary_preference() {
+        let mut tray_item = item("large-overlay", 1);
+        let source = std::sync::Arc::make_mut(&mut tray_item.icon);
+        source.icon_pixmap = vec![frame(96, [200, 200, 200, 255])];
+        source.overlay_icon_pixmap = vec![frame(64, [224, 30, 90, 255])];
+        let snapshot = TraySnapshot {
+            items: vec![tray_item],
+            ..TraySnapshot::default()
+        };
+        let mut cache = IconCache::default();
+        for theme in [light_panel(), original_icons()] {
+            cache.refresh_with_theme(&snapshot, 24, false, theme);
+            let item = &snapshot.items[0];
+            let icon = cache.item(&item.address, item.generation, 24).unwrap();
+            let (width, height, pixels) = raster_pixels(icon.overlay.as_ref().unwrap());
+            assert_eq!((width, height), (24, 24));
+            assert_eq!(&pixels[..4], &[224, 30, 90, 255]);
+        }
+    }
+
+    #[test]
+    fn cache_size_and_primary_generation_changes_rebuild_prepared_images() {
+        let mut tray_item = item("resizing-primary", 1);
+        std::sync::Arc::make_mut(&mut tray_item.icon).icon_pixmap =
+            vec![frame(96, [200, 200, 200, 255])];
+        let mut snapshot = TraySnapshot {
+            items: vec![tray_item],
+            ..TraySnapshot::default()
+        };
+        let mut cache = IconCache::default();
+        for size in [18, 24] {
+            cache.refresh_with_theme(&snapshot, size, false, light_panel());
+            let item = &snapshot.items[0];
+            let icon = cache.item(&item.address, item.generation, size).unwrap();
+            assert_eq!(raster_pixels(&icon.primary).0, u32::from(size) * 2);
+        }
+        let item = &mut snapshot.items[0];
+        item.generation.0 += 1;
+        std::sync::Arc::make_mut(&mut item.icon).icon_pixmap = vec![frame(96, [220, 20, 20, 255])];
+        cache.refresh_with_theme(&snapshot, 24, false, light_panel());
+        let item = &snapshot.items[0];
+        let icon = cache.item(&item.address, item.generation, 24).unwrap();
+        assert_eq!(&raster_pixels(&icon.primary).2[..4], &[220, 20, 20, 255]);
+    }
+    fn test_file(
+        path: PathBuf,
+        name: &str,
+        size: u16,
+        theme: &ThemeContext,
+    ) -> (icon::Handle, &'static str) {
+        let built = from_file(path, name, String::new(), size, theme, IconKind::Primary).unwrap();
+        (built.handle, built.paint)
+    }
+
+    fn raster_pixels(handle: &icon::Handle) -> (u32, u32, &[u8]) {
+        let icon::Data::Image(cosmic::iced::widget::image::Handle::Rgba {
+            width,
+            height,
+            pixels,
+            ..
+        }) = &handle.data
+        else {
+            panic!("expected decoded raster");
+        };
+        (*width, *height, pixels.as_ref())
+    }
+
+    fn frame(size: i32, rgba: [u8; 4]) -> Pixmap {
+        let [r, g, b, a] = rgba;
+        Pixmap {
+            width: size,
+            height: size,
+            bytes: [a, r, g, b].repeat(usize::try_from(size * size).unwrap()),
+        }
+    }
+
+    #[test]
+    fn the_cache_selects_hidpi_frames_and_preserves_overlay_colours() {
+        let mut tray_item = item("hidpi", 1);
+        let source = std::sync::Arc::make_mut(&mut tray_item.icon);
+        source.icon_pixmap = vec![
+            frame(24, [240; 4]),
+            frame(48, [240; 4]),
+            frame(64, [240; 4]),
+        ];
+        source.overlay_icon_pixmap =
+            vec![frame(12, [224, 30, 90, 255]), frame(24, [224, 30, 90, 255])];
+        let address = tray_item.address.clone();
+        let generation = tray_item.generation;
+        let snapshot = TraySnapshot {
+            items: vec![tray_item],
+            ..TraySnapshot::default()
+        };
+        let mut cache = IconCache::default();
+        for theme in [dark_panel(), light_panel(), original_icons()] {
+            assert!(!cache.refresh_with_theme(&snapshot, 24, false, theme));
+            let icon = cache.item(&address, generation, 24).unwrap();
+            let (width, height, _) = raster_pixels(&icon.primary);
+            assert_eq!((width, height), (48, 48));
+            let (width, height, pixels) = raster_pixels(icon.overlay.as_ref().unwrap());
+            assert_eq!((width, height), (24, 24));
+            assert_eq!(pixels, [224, 30, 90, 255].repeat(24 * 24));
+        }
+    }
+
+    #[test]
+    fn overlays_appear_change_and_disappear_with_item_generations() {
+        let mut tray_item = item("overlay", 1);
+        std::sync::Arc::make_mut(&mut tray_item.icon).icon_pixmap = vec![frame(24, [255; 4])];
+        let address = tray_item.address.clone();
+        let mut snapshot = TraySnapshot {
+            items: vec![tray_item],
+            ..TraySnapshot::default()
+        };
+        let mut cache = IconCache::default();
+        for colour in [None, Some([255, 0, 0, 255]), Some([0, 180, 255, 255]), None] {
+            let tray_item = &mut snapshot.items[0];
+            tray_item.generation.0 += 1;
+            let generation = tray_item.generation;
+            std::sync::Arc::make_mut(&mut tray_item.icon).overlay_icon_pixmap =
+                colour.map(|c| vec![frame(12, c)]).unwrap_or_default();
+            assert!(!cache.refresh_with_theme(&snapshot, 24, false, dark_panel()));
+            let icon = cache.item(&address, generation, 24).unwrap();
+            if let Some(colour) = colour {
+                assert_eq!(
+                    &raster_pixels(icon.overlay.as_ref().unwrap()).2[..4],
+                    &colour
+                );
+            } else {
+                assert!(icon.overlay.is_none());
+            }
+            assert_eq!(cache.entries.len(), 2);
+        }
+    }
+
+    #[test]
+    fn invalid_overlay_files_use_the_pixmap_or_remain_absent() {
+        let root = test_root("invalid-overlay");
+        let broken = svg_at(&root, "broken", "not an svg");
+        let mut options = IconOptions {
+            path: Some(broken.to_string_lossy().into_owned()),
+            ..IconOptions::default()
+        };
+        assert!(build_artwork(&options, 12, &original_icons(), IconKind::Overlay).is_none());
+        options.pixels = Some(std::sync::Arc::new(pixmap(12, |_, _| [224, 30, 90, 255])));
+        let built = build_artwork(&options, 12, &original_icons(), IconKind::Overlay).unwrap();
+        assert_eq!(&raster_pixels(&built.handle).2[..4], &[224, 30, 90, 255]);
+        assert!(!built.fallback);
+        assert!(
+            build_artwork(
+                &IconOptions::default(),
+                12,
+                &original_icons(),
+                IconKind::Overlay
+            )
+            .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_explicit_symbolic_overlays_follow_the_theme() {
+        let root = test_root("symbolic-overlay");
+        for (name, symbolic) in [("plain", false), ("plain-symbolic", true)] {
+            let path = svg_at(
+                &root,
+                name,
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\"><rect width=\"12\" height=\"12\" fill=\"#444\"/></svg>",
+            );
+            let options = IconOptions {
+                path: Some(path.to_string_lossy().into_owned()),
+                ..IconOptions::default()
+            };
+            let built = build_artwork(&options, 12, &original_icons(), IconKind::Overlay).unwrap();
+            assert!(!built.handle.symbolic);
+            assert_eq!(
+                built.paint,
+                if symbolic {
+                    "symbolic-explicit"
+                } else {
+                    "original-disabled"
+                }
+            );
+            let expected = if symbolic {
+                original_icons().ink
+            } else {
+                [68; 3]
+            };
+            assert_eq!(&raster_pixels(&built.handle).2[..3], &expected);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn a_published_path_is_found_without_waiting_for_the_global_cache() {
@@ -498,6 +773,16 @@ mod tests {
             third,
             "the original colour mode rebuilds the handle"
         );
+
+        let original = hash(&cache);
+        let mut other_background = original_icons();
+        other_background.background = [200; 3];
+        cache.refresh_with_theme(&snapshot, 24, false, other_background);
+        assert_ne!(
+            hash(&cache),
+            original,
+            "a background change rebuilds the handle"
+        );
     }
 
     #[test]
@@ -585,18 +870,19 @@ mod tests {
         let path = svg_at(
             &root,
             "explicit-symbolic",
-            "<svg><path fill=\"red\"/><path fill=\"blue\"/></svg>",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><rect width=\"8\" height=\"16\" fill=\"red\"/><rect x=\"8\" width=\"8\" height=\"16\" fill=\"blue\"/></svg>",
         );
 
-        let (handle, policy) = handle_for(path, "explicit-symbolic", 16, &light_panel());
+        let (handle, policy) = test_file(path, "explicit-symbolic", 16, &light_panel());
 
-        assert!(handle.symbolic);
+        assert!(!handle.symbolic);
+        assert_eq!(&raster_pixels(&handle).2[..3], &light_panel().ink);
         assert_eq!(policy, "symbolic-explicit");
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn a_multicolour_svg_is_tinted_without_becoming_symbolic() {
+    fn a_multicolour_svg_is_rasterized_without_recolouring() {
         let root = test_root("painted-vector");
         let path = svg_at(
             &root,
@@ -606,15 +892,16 @@ mod tests {
              <rect x=\"8\" width=\"8\" height=\"16\" fill=\"blue\"/></svg>",
         );
 
-        let (handle, policy) = handle_for(path, "painted-vector", 16, &light_panel());
+        let (handle, policy) = test_file(path, "painted-vector", 16, &light_panel());
 
         assert!(!handle.symbolic);
-        assert_eq!(policy, "tinted-detailed");
+        assert_eq!(policy, "original-coloured");
+        assert_eq!(&raster_pixels(&handle).2[..4], &[255, 0, 0, 255]);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn a_multicolour_svg_too_large_to_tint_falls_back_to_the_panel_ink() {
+    fn a_multicolour_svg_too_large_to_tint_keeps_its_original_artwork() {
         let root = test_root("oversized-vector");
         let filler = "<rect width=\"1\" height=\"1\" fill=\"red\"/>".repeat(9000);
         let path = svg_at(
@@ -628,10 +915,10 @@ mod tests {
         );
         assert!(std::fs::metadata(&path).unwrap().len() > 256 * 1024);
 
-        let (handle, policy) = handle_for(path, "oversized", 16, &light_panel());
+        let (handle, policy) = test_file(path, "oversized", 16, &light_panel());
 
-        assert!(handle.symbolic);
-        assert_eq!(policy, "symbolic-painted");
+        assert!(!handle.symbolic);
+        assert_eq!(policy, "original-unprocessed");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -644,10 +931,10 @@ mod tests {
             "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"16\" height=\"16\" fill=\"red\"/></svg>",
         );
 
-        let (handle, policy) = handle_for(path, "regular", 16, &original_icons());
+        let (handle, policy) = test_file(path, "regular", 16, &original_icons());
 
         assert!(!handle.symbolic);
-        assert_eq!(policy, "original");
+        assert_eq!(policy, "original-disabled");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -660,9 +947,10 @@ mod tests {
             "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"16\" height=\"16\"/></svg>",
         );
 
-        let (handle, policy) = handle_for(path, "regular-symbolic", 16, &original_icons());
+        let (handle, policy) = test_file(path, "regular-symbolic", 16, &original_icons());
 
-        assert!(handle.symbolic);
+        assert!(!handle.symbolic);
+        assert_eq!(&raster_pixels(&handle).2[..3], &original_icons().ink);
         assert_eq!(policy, "symbolic-explicit");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -676,7 +964,7 @@ mod tests {
 
         let built = build(&options, 10, &original_icons());
 
-        assert_eq!(built.paint, "original");
+        assert_eq!(built.paint, "original-disabled");
         assert!(!built.handle.symbolic);
     }
 
@@ -693,17 +981,23 @@ mod tests {
         let path = root.join("tray.png");
         png_at(&path, &glyph);
 
-        let (_, payload) = handle_from(path.clone(), "", Origin::Payload, 10, &light_panel());
-        let (_, published) = handle_from(path, "", Origin::Published, 10, &light_panel());
-
-        assert_eq!(
-            payload, "payload-recoloured",
-            "a payload raster follows the panel theme"
-        );
-        assert_eq!(
-            published, "published-recoloured",
-            "a published raster follows the same content-based rule"
-        );
+        for source in ["payload", "published"] {
+            let built = from_file(
+                path.clone(),
+                "",
+                source.to_owned(),
+                10,
+                &light_panel(),
+                IconKind::Primary,
+            )
+            .unwrap();
+            assert_eq!(built.paint, "monotone");
+            assert_eq!(built.source, source);
+            assert_eq!(
+                &raster_pixels(&built.handle).2[3 * 10 * 4..3 * 10 * 4 + 3],
+                &light_panel().ink
+            );
+        }
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -711,12 +1005,16 @@ mod tests {
     #[test]
     fn vector_artwork_from_a_payload_still_goes_through_symbolic_detection() {
         let root = test_root("payload-vector");
-        let path = svg_at(&root, "glyph-symbolic", "<svg/>");
+        let path = svg_at(
+            &root,
+            "glyph-symbolic",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><rect width=\"16\" height=\"16\"/></svg>",
+        );
 
-        let (handle, paint) =
-            handle_from(path, "glyph-symbolic", Origin::Payload, 16, &light_panel());
+        let (handle, paint) = test_file(path, "glyph-symbolic", 16, &light_panel());
 
-        assert!(handle.symbolic);
+        assert!(!handle.symbolic);
+        assert_eq!(&raster_pixels(&handle).2[..3], &light_panel().ink);
         assert_eq!(paint, "symbolic-explicit");
 
         std::fs::remove_dir_all(root).unwrap();
