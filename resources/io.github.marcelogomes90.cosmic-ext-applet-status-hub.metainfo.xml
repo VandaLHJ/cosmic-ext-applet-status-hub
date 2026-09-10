@@ -31,6 +31,10 @@
       <caption>An application's tray menu, opened from the popup</caption>
     </screenshot>
     <screenshot>
+      <image>https://raw.githubusercontent.com/marcelogomes90/cosmic-ext-applet-status-hub/main/resources/screenshots/item-menu-rounded.png</image>
+      <caption>An application's tray menu under a rounded COSMIC theme</caption>
+    </screenshot>
+    <screenshot>
       <image>https://raw.githubusercontent.com/marcelogomes90/cosmic-ext-applet-status-hub/main/resources/screenshots/settings.png</image>
       <caption>The settings view, where any item can be pinned to the panel</caption>
     </screenshot>
@@ -40,7 +44,7 @@
     </screenshot>
     <screenshot>
       <image>https://raw.githubusercontent.com/marcelogomes90/cosmic-ext-applet-status-hub/main/resources/screenshots/item-menu-light.png</image>
-      <caption>The same popup on a light theme, with every icon repainted to match it</caption>
+      <caption>The same popup on a light theme, with symbolic icons adapted and coloured icons preserved</caption>
     </screenshot>
   </screenshots>
   <launchable type="desktop-id">io.github.marcelogomes90.cosmic-ext-applet-status-hub.desktop</launchable>
@@ -73,6 +77,18 @@
     <keyword>Panel</keyword>
   </keywords>
   <releases>
+    <release type="stable" version="1.5.5" date="2026-09-10">
+      <description>
+        <p>Tray icons now retain their detail more reliably across themes and panel sizes.</p>
+        <ul>
+          <li>Recolours only symbolic, neutral monotone and simple neutral duotone artwork, leaving coloured icons and complex outlines unchanged.</li>
+          <li>Recognizes antialiased simple artwork without mistaking broad gradients or layered contours for a themeable icon.</li>
+          <li>Preserves embedded notification badges and composes published overlay icons independently in every applet view.</li>
+          <li>Rasterizes and resizes all supported icon sources independently of recolouring, using high-resolution rendering and premultiplied-alpha filtering.</li>
+          <li>Selects better SNI pixmap frames and keeps non-square artwork proportional.</li>
+        </ul>
+      </description>
+    </release>
     <release type="stable" version="1.5.4" date="2026-09-05">
       <description>
         <p>The settings popup no longer scrolls while its content still fits, and the panel icon and the grid of tray icons have been redrawn around their own weight.</p>
