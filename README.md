@@ -29,6 +29,10 @@ so they stay one click away.
 - Resolves icons from icon names, absolute paths, or raw pixmap bytes, with attention and
   overlay icon support.
 - Lets you choose whether application icons keep their published colours or follow the panel theme.
+  Only neutral monotones and simple duotones are automatically recoloured; coloured artwork and
+  complex outlines stay original. Detected badges and separate overlays keep their colours.
+  Explicit symbolic icons always follow the theme. High-resolution image preparation works in
+  either mode.
 - Uses the standard tray mouse controls: left click activates the application, middle click
   requests its optional secondary action, and right click opens its menu. Activation requests
   carry an XDG activation token so the target application can raise its window.
@@ -43,19 +47,12 @@ so they stay one click away.
 
 ### Flatpak
 
-Status Hub is currently being submitted to the official COSMIC Flatpak repository. Direct installation from the COSMIC repository will be available once the submission is accepted.
-
-In the meantime, you can build and install the Flatpak locally:
+Status Hub is available from the official COSMIC Flatpak repository:
 
 ```sh
-git clone https://github.com/marcelogomes90/cosmic-ext-applet-status-hub.git
-cd cosmic-ext-applet-status-hub
-
-flatpak-builder --user --install --force-clean build-dir \
-  flatpak/io.github.marcelogomes90.cosmic-ext-applet-status-hub/io.github.marcelogomes90.cosmic-ext-applet-status-hub.json
+flatpak remote-add --if-not-exists --user cosmic https://apt.pop-os.org/cosmic/cosmic.flatpakrepo
+flatpak install --user cosmic io.github.marcelogomes90.cosmic-ext-applet-status-hub
 ```
-
-This requires `flatpak-builder` and the required Flatpak runtimes.
 
 ### From source
 
